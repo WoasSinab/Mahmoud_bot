@@ -7,25 +7,38 @@ from zoneinfo import ZoneInfo
 import requests
 from flask import Flask, request
 
+# Gemini
+from google import genai
+
 app = Flask(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 if not BOT_TOKEN or not WEBHOOK_SECRET:
     raise RuntimeError("BOT_TOKEN or WEBHOOK_SECRET is missing")
 
-# Timezone (تو گفتی Europe/Paris هم اوکیه. اگر خواستی بعداً Kabul کنیم)
+# اگر خواستی تایم‌زون رو بعداً عوض کنیم (مثلاً Asia/Kabul)
 TZ = ZoneInfo("Europe/Paris")
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "db.sqlite3")
 
 REMINDERS = [
-    ("r3_sent", timedelta(hours=3),  "⏳ داداش ۳ ساعت دیگه وقتشه: {title}"),
-    ("r1_sent", timedelta(hours=1),  "⚠️ مشتی ۱ ساعت دیگه می‌رسه: {title}"),
+    ("r3_sent", timedelta(hours=3),   "⏳ داداش ۳ ساعت دیگه وقتشه: {title}"),
+    ("r1_sent", timedelta(hours=1),   "⚠️ مشتی ۱ ساعت دیگه می‌رسه: {title}"),
     ("r5_sent", timedelta(minutes=5), "🚨 ۵ دقیقه مونده‌ها! آماده شو: {title}"),
     ("due_sent", timedelta(seconds=0), "⏰ وقتشه داداش! الان بزن بریم: {title}"),
 ]
+
+client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+SYSTEM_STYLE = (
+    "تو یک دستیار تلگرام هستی به اسم «محمود»؛ "
+    "خیلی خودمونی، لاتی و مشتی حرف می‌زنی، ولی محترمانه و بدون توهین یا حرف زشت. "
+    "پاسخ‌ها کوتاه، کاربردی، و با شوخی ملایم باشه. "
+    "اگر کاربر چیزی خواست که نیاز به زمان/تاریخ/جزئیات داره، یک سوال کوتاه بپرس."
+)
 
 def db():
     conn = sqlite3.connect(DB_PATH)
@@ -52,7 +65,7 @@ def tg_send(chat_id: str, text: str):
 def parse_due(text: str) -> datetime:
     """
     Supported:
-      - HH:MM  (today)
+      - HH:MM  (today; if passed, auto to tomorrow)
       - YYYY-MM-DD HH:MM
     """
     text = text.strip()
@@ -65,13 +78,24 @@ def parse_due(text: str) -> datetime:
     except ValueError:
         pass
 
-    # HH:MM (today)
+    # HH:MM
     try:
         t = datetime.strptime(text, "%H:%M")
         dt = now.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
         return dt
     except ValueError:
         raise ValueError("Bad time format")
+
+def gemini_reply(user_text: str) -> str:
+    if not client:
+        return "داداش Gemini هنوز وصل نیست 😅 کلیدشو تو Render بذار تا روشن شم."
+    prompt = f"{SYSTEM_STYLE}\n\nکاربر: {user_text}\nمحمود:"
+    resp = client.models.generate_content(
+        model="gemini-1.5-flash",
+        contents=prompt
+    )
+    text = (resp.text or "").strip()
+    return text or "یه لحظه مغزم هنگ کرد 😄 دوباره بگو."
 
 @app.get("/")
 def root():
@@ -93,13 +117,14 @@ def webhook():
         tg_send(
             str(chat_id),
             "سلام سینا 😄\n"
-            "من آنلاینم مشتی ✅\n\n"
-            "دستورها:\n"
+            "من محمودم، منشی مشتی‌ات ✅\n\n"
+            "کارها:\n"
             "/add عنوان | ساعت\n"
             "مثال: /add باشگاه | 21:30\n"
             "یا با تاریخ: /add جلسه | 2026-01-07 14:00\n\n"
             "/list\n"
-            "/done ID"
+            "/done ID\n\n"
+            "غیر از اینا هر چی بگی می‌دم Gemini برات جواب بده 😎"
         )
         return {"ok": True}
 
@@ -113,7 +138,7 @@ def webhook():
             now_ts = int(time.time())
             due_ts = int(due_dt.timestamp())
 
-            # اگر ساعتِ امروز گذشته بود، خودکار بنداز فردا
+            # اگر HH:MM امروز گذشته بود، بنداز فردا
             if len(when) == 5 and due_ts < now_ts:
                 due_dt = due_dt + timedelta(days=1)
                 due_ts = int(due_dt.timestamp())
@@ -161,15 +186,12 @@ def webhook():
         tg_send(str(chat_id), "لیست کارات مشتی:\n" + "\n".join(lines))
         return {"ok": True}
 
-    # /done ID
+    # /done
     if text.startswith("/done"):
         try:
             task_id = int(text.replace("/done", "", 1).strip())
             conn = db()
-            conn.execute(
-                "UPDATE tasks SET done=1 WHERE chat_id=? AND id=?",
-                (str(chat_id), task_id)
-            )
+            conn.execute("UPDATE tasks SET done=1 WHERE chat_id=? AND id=?", (str(chat_id), task_id))
             conn.commit()
             conn.close()
             tg_send(str(chat_id), f"دمت گرم 😄 کار ID={task_id} انجام شد ✅")
@@ -177,12 +199,13 @@ def webhook():
             tg_send(str(chat_id), "داداش اینجوری بزن: /done 3")
         return {"ok": True}
 
-    # default
-    tg_send(str(chat_id), "گرفتم مشتی 😄\nبرای کارها /add یا /list بزن.")
+    # default -> Gemini
+    reply = gemini_reply(text)
+    tg_send(str(chat_id), reply)
     return {"ok": True}
 
 
-# Cron اینو هر 1 دقیقه صدا می‌زنه
+# این URL رو UptimeRobot هر ۱ دقیقه می‌زنه
 @app.get(f"/tick/{WEBHOOK_SECRET}")
 def tick():
     now_ts = int(time.time())
@@ -195,7 +218,7 @@ def tick():
 
     sent_count = 0
 
-    for (task_id, chat_id, title, due_ts, r3, r1, r5, due_sent) in rows:
+    for task_id, chat_id, title, due_ts, r3, r1, r5, due_sent in rows:
         due_dt = datetime.fromtimestamp(int(due_ts), TZ)
         now_dt = datetime.fromtimestamp(now_ts, TZ)
 
@@ -207,15 +230,10 @@ def tick():
 
             fire_time = due_dt - delta
             if now_dt >= fire_time:
-                # پیام
                 tg_send(str(chat_id), template.format(title=title))
-
-                # آپدیت DB
                 conn.execute(f"UPDATE tasks SET {col}=1 WHERE id=?", (task_id,))
                 conn.commit()
                 sent_count += 1
-
-        # اگر due_sent شد، دیگه لازم نیست کاری کنیم (ولی done نیست تا خودت /done بزنی)
 
     conn.close()
     return {"ok": True, "sent": sent_count}
