@@ -211,9 +211,14 @@ def webhook():
         return {"ok": True}
 
     # default -> Gemini
-    reply = gemini_reply(text)
+    try:
+      reply = gemini_reply(text)
+    except Exception:
+      reply = "داداش یه مشکلی خورد 😅 ولی من هستم. بگو چی می‌خوای؟"
+
     tg_send(str(chat_id), reply)
     return {"ok": True}
+
 
 
 # این URL رو UptimeRobot هر ۱ دقیقه می‌زنه
