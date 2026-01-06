@@ -20,16 +20,20 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 if not BOT_TOKEN or not WEBHOOK_SECRET:
     raise RuntimeError("BOT_TOKEN or WEBHOOK_SECRET is missing")
 
-# اگر خواستی بعداً کابل: ZoneInfo("Asia/Kabul")
+# اگر خواستی کابل: ZoneInfo("Asia/Kabul")
 TZ = ZoneInfo("Europe/Paris")
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "db.sqlite3")
 
 SYSTEM_STYLE = (
-    "تو یک دستیار تلگرام هستی به اسم «محمود»؛ "
-    "خیلی خودمونی، لاتی و مشتی حرف می‌زنی، ولی محترمانه و بدون توهین یا حرف زشت. "
-    "پاسخ‌ها کوتاه، کاربردی، و با شوخی ملایم باشه. "
-    "اگر کاربر چیزی خواست که نیاز به زمان/تاریخ/جزئیات داره، یک سوال کوتاه بپرس."
+    "اسم تو «محمود»ه؛ دستیار تلگرامِ سینا. "
+    "خیلی خودمونی، مشتی و رفیق‌طور حرف می‌زنی ولی مودب می‌مونی (بدون فحش/توهین). "
+    "جواب‌ها کوتاه، دقیق، کاربردی.\n"
+    "قالب جواب:\n"
+    "1) جواب اصلی 1 تا 4 خط\n"
+    "2) اگر لازم بود 1 بولت «پیشنهاد سریع»\n"
+    "3) اگر اطلاعات کم بود فقط 1 سوال کوتاه بپرس\n"
+    "اگر کاربر برنامه/کار گفت، پیشنهاد بده با /add ثبتش کنه.\n"
 )
 
 REMINDERS = [
@@ -56,12 +60,51 @@ def db():
             due_sent INTEGER NOT NULL DEFAULT 0
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS chat_memory (
+            chat_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            ts INTEGER NOT NULL
+        )
+    """)
     return conn
+
+def mem_add(chat_id: str, role: str, content: str):
+    # محتوا رو کوتاه نگه می‌داریم که DB سنگین نشه
+    content = (content or "")[:2000]
+    conn = db()
+    conn.execute(
+        "INSERT INTO chat_memory(chat_id, role, content, ts) VALUES(?,?,?,?)",
+        (chat_id, role, content, int(time.time()))
+    )
+    # فقط 20 تا آخر
+    conn.execute("""
+        DELETE FROM chat_memory
+        WHERE chat_id=? AND ts NOT IN (
+            SELECT ts FROM chat_memory WHERE chat_id=? ORDER BY ts DESC LIMIT 20
+        )
+    """, (chat_id, chat_id))
+    conn.commit()
+    conn.close()
+
+def mem_get(chat_id: str):
+    conn = db()
+    rows = conn.execute(
+        "SELECT role, content FROM chat_memory WHERE chat_id=? ORDER BY ts ASC",
+        (chat_id,)
+    ).fetchall()
+    conn.close()
+    # role باید system/user/assistant باشه
+    out = []
+    for r, c in rows:
+        r = r if r in ("user", "assistant", "system") else "user"
+        out.append({"role": r, "content": c})
+    return out
 
 # ===== Telegram send =====
 def tg_send(chat_id: str, text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    # هیچ‌وقت اینجا کرش نکنیم
     try:
         requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=20)
     except Exception as e:
@@ -77,14 +120,12 @@ def parse_due(text: str) -> datetime:
     text = text.strip()
     now = datetime.now(TZ)
 
-    # YYYY-MM-DD HH:MM
     try:
         dt = datetime.strptime(text, "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
         return dt
     except ValueError:
         pass
 
-    # HH:MM
     try:
         t = datetime.strptime(text, "%H:%M")
         dt = now.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
@@ -93,7 +134,7 @@ def parse_due(text: str) -> datetime:
         raise ValueError("Bad time format")
 
 # ===== AI (Groq) =====
-def ai_reply(user_text: str) -> str:
+def ai_reply(chat_id: str, user_text: str) -> str:
     if AI_PROVIDER != "groq":
         return "داداش AI هنوز تنظیم نشده 😄"
 
@@ -106,23 +147,43 @@ def ai_reply(user_text: str) -> str:
             base_url="https://api.groq.com/openai/v1",
         )
 
+        history = mem_get(chat_id)
+        messages = [{"role": "system", "content": SYSTEM_STYLE}] + history + [
+            {"role": "user", "content": user_text}
+        ]
+
+        # مدل قوی‌تر برای جواب‌های بهتر (اگر rate limit خورد، fallback داریم)
         resp = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": SYSTEM_STYLE},
-                {"role": "user", "content": user_text},
-            ],
-            temperature=0.7,
+            model="llama-3.3-70b-versatile",
+            messages=messages,
+            temperature=0.8,
         )
+
         text = (resp.choices[0].message.content or "").strip()
         return text or "یه لحظه مغزم هنگ کرد 😄 دوباره بگو."
+
     except Exception as e:
         err = str(e).lower()
-        # اگر rate limit یا quota یا هرچی خورد
         if "rate" in err or "quota" in err or "429" in err:
-            return "داداش الان AI یه کم شلوغه 😅 چند ثانیه دیگه دوباره بگو."
+            # fallback مدل سبک‌تر
+            try:
+                client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
+                resp = client.chat.completions.create(
+                    model="llama-3.1-8b-instant",
+                    messages=[
+                        {"role": "system", "content": SYSTEM_STYLE},
+                        {"role": "user", "content": user_text},
+                    ],
+                    temperature=0.7,
+                )
+                text = (resp.choices[0].message.content or "").strip()
+                return text or "الان یه لحظه شلوغه 😅 دوباره بگو."
+            except Exception as e2:
+                print("GROQ_FALLBACK_ERROR:", repr(e2))
+                return "داداش AI شلوغه 😅 یکم دیگه دوباره بگو."
+
         print("GROQ_ERROR:", repr(e))
-        return "داداش AI یه گیر خورد 😅 ولی من هستم. چی می‌خوای؟"
+        return "داداش یه گیر فنی خورد 😅 ولی من هستم. بگو چی می‌خوای؟"
 
 # ===== Routes =====
 @app.get("/")
@@ -145,10 +206,12 @@ def webhook():
         if not chat_id:
             return {"ok": True}
 
+        chat_id = str(chat_id)
+
         # /start
         if text == "/start":
             tg_send(
-                str(chat_id),
+                chat_id,
                 "سلام سینا 😄\n"
                 "من محمودم، منشی مشتی‌ات ✅\n\n"
                 "کارها:\n"
@@ -157,7 +220,7 @@ def webhook():
                 "یا با تاریخ: /add جلسه | 2026-01-07 14:00\n\n"
                 "/list\n"
                 "/done ID\n\n"
-                "هر چی غیر از دستورها بگی، می‌دم AI جواب بده 😎"
+                "غیر از اینا هر چی بگی، می‌دم AI جواب بده 😎"
             )
             return {"ok": True}
 
@@ -179,17 +242,17 @@ def webhook():
                 conn = db()
                 conn.execute(
                     "INSERT INTO tasks(chat_id,title,due_ts,created_ts,done) VALUES(?,?,?,?,0)",
-                    (str(chat_id), title, due_ts, now_ts)
+                    (chat_id, title, due_ts, now_ts)
                 )
                 conn.commit()
                 task_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
                 conn.close()
 
                 pretty = due_dt.strftime("%Y-%m-%d %H:%M")
-                tg_send(str(chat_id), f"ثبت شد مشتی ✅ (ID={task_id})\n⏱ زمان: {pretty}")
+                tg_send(chat_id, f"ثبت شد مشتی ✅ (ID={task_id})\n⏱ زمان: {pretty}")
             except Exception:
                 tg_send(
-                    str(chat_id),
+                    chat_id,
                     "داداش فرمتش اینه 😄\n"
                     "/add عنوان | ساعت\n"
                     "مثال: /add باشگاه | 21:30\n"
@@ -202,12 +265,12 @@ def webhook():
             conn = db()
             rows = conn.execute(
                 "SELECT id, title, due_ts, done FROM tasks WHERE chat_id=? ORDER BY done ASC, due_ts ASC LIMIT 30",
-                (str(chat_id),)
+                (chat_id,)
             ).fetchall()
             conn.close()
 
             if not rows:
-                tg_send(str(chat_id), "هیچی ثبت نکردی هنوز داداش 😄 /add بزن")
+                tg_send(chat_id, "هیچی ثبت نکردی هنوز داداش 😄 /add بزن")
                 return {"ok": True}
 
             lines = []
@@ -216,7 +279,7 @@ def webhook():
                 status = "✅" if done else "🕒"
                 lines.append(f"{status} ID={task_id} — {title} — {dt}")
 
-            tg_send(str(chat_id), "لیست کارات مشتی:\n" + "\n".join(lines))
+            tg_send(chat_id, "لیست کارات مشتی:\n" + "\n".join(lines))
             return {"ok": True}
 
         # /done
@@ -224,27 +287,28 @@ def webhook():
             try:
                 task_id = int(text.replace("/done", "", 1).strip())
                 conn = db()
-                conn.execute("UPDATE tasks SET done=1 WHERE chat_id=? AND id=?", (str(chat_id), task_id))
+                conn.execute("UPDATE tasks SET done=1 WHERE chat_id=? AND id=?", (chat_id, task_id))
                 conn.commit()
                 conn.close()
-                tg_send(str(chat_id), f"دمت گرم 😄 کار ID={task_id} انجام شد ✅")
+                tg_send(chat_id, f"دمت گرم 😄 کار ID={task_id} انجام شد ✅")
             except Exception:
-                tg_send(str(chat_id), "داداش اینجوری بزن: /done 3")
+                tg_send(chat_id, "داداش اینجوری بزن: /done 3")
             return {"ok": True}
 
-        # default: AI
+        # default: AI with memory
         try:
-            reply = ai_reply(text)
+            mem_add(chat_id, "user", text)
+            reply = ai_reply(chat_id, text)
+            mem_add(chat_id, "assistant", reply)
         except Exception as e:
             print("AI_REPLY_FATAL_ERROR:", repr(e))
             reply = "داداش یه مشکل ریز خورد 😅 ولی من هستم. بگو چی می‌خوای؟"
 
-        tg_send(str(chat_id), reply)
+        tg_send(chat_id, reply)
         return {"ok": True}
 
     except Exception as e:
         print("WEBHOOK_FATAL_ERROR:", repr(e))
-        # خیلی مهم: 200 بده
         return {"ok": True}
 
 # UptimeRobot هر ۱ دقیقه اینو بزنه
