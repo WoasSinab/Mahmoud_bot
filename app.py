@@ -88,14 +88,25 @@ def parse_due(text: str) -> datetime:
 
 def gemini_reply(user_text: str) -> str:
     if not client:
-        return "داداش Gemini هنوز وصل نیست 😅 کلیدشو تو Render بذار تا روشن شم."
-    prompt = f"{SYSTEM_STYLE}\n\nکاربر: {user_text}\nمحمود:"
-    resp = client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=prompt
-    )
-    text = (resp.text or "").strip()
-    return text or "یه لحظه مغزم هنگ کرد 😄 دوباره بگو."
+        return "داداش Gemini وصل نیست 😅 ولی من هستم. چی می‌خوای؟"
+
+    try:
+        prompt = f"{SYSTEM_STYLE}\n\nکاربر: {user_text}\nمحمود:"
+        resp = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt
+        )
+        text = (resp.text or "").strip()
+        return text or "یه لحظه هنگ کردم 😄 دوباره بگو."
+    except Exception as e:
+        err = str(e)
+        # Quota / rate-limit
+        if "RESOURCE_EXHAUSTED" in err or "429" in err or "quota" in err.lower():
+            return "داداش سهمیه Gemini فعلاً تمومه/فعّال نیست 😅\nولی من هنوز منشی‌تم. بگو چی کار داری؟"
+        # Any other error
+        print("GEMINI_ERROR:", repr(e))
+        return "داداش یه ایراد فنی خورد 😅 ولی من زنده‌ام. بگو چی می‌خوای؟"
+
 
 @app.get("/")
 def root():
