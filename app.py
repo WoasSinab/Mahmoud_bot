@@ -91,7 +91,7 @@ def gemini_reply(user_text: str) -> str:
         return "داداش Gemini هنوز وصل نیست 😅 کلیدشو تو Render بذار تا روشن شم."
     prompt = f"{SYSTEM_STYLE}\n\nکاربر: {user_text}\nمحمود:"
     resp = client.models.generate_content(
-        model="gemini-1.5-flash",
+        model="gemini-2.0-flash",
         contents=prompt
     )
     text = (resp.text or "").strip()
